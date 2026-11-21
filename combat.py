@@ -32,8 +32,9 @@ def intercept_time(delta, velocity, speed):
 
 
 class FireControl:
-    def __init__(self, campus):
+    def __init__(self, campus, tick_seconds=0.05):
         self.campus = campus
+        self.tick_seconds = tick_seconds
         self.focus = None
 
     def exposed(self, origin, target):
@@ -48,6 +49,8 @@ class FireControl:
     def choose(self, me, contacts, crates, recovery, aggressor):
         pos = me["pos"]
         origin = (pos[0], pos[1], pos[2] + me["stats"]["muzzle_height"])
+        weapons = {w["kind"]: w for w in me["weapons"] if w}
+        arc = weapons.get("lightning")
         best = None
         blocked = []
         best_score = -math.inf
@@ -63,7 +66,14 @@ class FireControl:
                 continue
             pitch = point_aim(origin, dest)[1]
             if not (me["stats"]["min_pitch"] - 0.06 <= pitch <= me["stats"]["max_pitch"] + 0.06):
-                continue
+                if (
+                    arc
+                    and math.dist(origin, dest) < arc["stats"]["range"]
+                    and me["energy"] >= arc["stats"]["energy"]
+                ):
+                    target = dict(target, arc_only=True)
+                else:
+                    continue
             hp = target.get("hp", 1400)
             bearing = math.atan2(dest[1] - pos[1], dest[0] - pos[0])
             if kind == "mech":
@@ -71,6 +81,13 @@ class FireControl:
                 rear = abs(angle(bearing + math.pi - target.get("aim", (0, 0))[0])) > math.pi / 2
                 score = 175 - min(2200, hp / (1.5 if rear else 1)) * 0.038 - 0.29 * d
                 score += 21 * (target["id"] == aggressor) + 13 * target.get("charging", False)
+                gear = target.get("weapons", ())
+                if "laser" in weapons and "mortar" in gear:
+                    score += 27
+                if arc and d < arc["stats"]["range"]:
+                    score += 22 + 23 * ("laser" in gear)
+                if "mortar" in weapons and "laser" in gear and target.get("charging"):
+                    score += 16
                 if recovery and d > 62 and hp > 270:
                     continue
             else:
@@ -153,6 +170,31 @@ class FireControl:
                 last = pt
         return yaw, pitch
 
+    def support_arc(self, me, aim, fire, contacts):
+        """Use a ready lightning arc on a nearby attacker while tracking another target."""
+        if not contacts:
+            return
+        slot = next(((i, w) for i, w in enumerate(me["weapons"]) if w and w["kind"] == "lightning"), None)
+        if not slot:
+            return
+        i, weapon = slot
+        stats = weapon["stats"]
+        if fire[i] or me["energy"] < stats["energy"] + 1 or weapon["cooldown"] >= 0.11:
+            return
+        muzzle = (*me["pos"][:2], me["pos"][2] + me["stats"]["muzzle_height"])
+        # The torso has one physics tick to slew before the arc is emitted.
+        max_turn = me["stats"]["turn_rate"] * self.tick_seconds
+        yaw = me["aim"][0] + max(-max_turn, min(max_turn, angle(aim[0] - me["aim"][0])))
+        for contact in contacts:
+            hull = (*contact["pos"][:2], contact["pos"][2] + contact["height"] * 0.55)
+            if (
+                math.dist(muzzle, hull) < stats["range"] - 1
+                and abs(angle(point_aim(muzzle, hull)[0] - yaw)) < math.radians(stats["cone_deg"]) - 0.04
+                and (not self.campus or self.campus.clear(muzzle, hull))
+            ):
+                fire[i] = True
+                return
+
     def command(self, me, chosen, scan_yaw, dangerous):
         slots = {w["kind"]: (i, w) for i, w in enumerate(me["weapons"]) if w}
         gun = slots.get("gun", (None, None))[1]
@@ -189,7 +231,15 @@ class FireControl:
             if d < s["range"] and w["cooldown"] < 0.1:
                 charged = w["charge"]
                 power = (0.35 + 0.65 * min(1, charged / s["charge"])) * s["damage"]
-                lethal = power * (1 + 0.04 * min(me["cubes"], 10)) >= target.get("hp", 9999)
+                damage = power * (1 + 0.04 * min(me["cubes"], 10))
+                if "mortar" in target.get("weapons", ()):
+                    damage *= 1 + s.get("cookoff", 0.6)
+                if (
+                    target["kind"] == "mech"
+                    and abs(angle(hitscan[0] + math.pi - target["aim"][0])) > math.pi * 0.56
+                ):
+                    damage *= me["stats"]["rear_mult"]
+                lethal = damage >= target.get("hp", 9999)
                 release = charged >= s["charge"] - 0.011 or (charged >= s["min_charge"] and lethal)
                 if release or charged >= s["charge"] - 0.15:
                     aim = hitscan
@@ -200,6 +250,8 @@ class FireControl:
                     and abs(pitch - hitscan[1]) < 0.05 + tolerance
                 )
                 fire[i] = not (release and lined)
+        if target.get("arc_only"):
+            aim = hitscan
         if gun:
             i = slots["gun"][0]
             # Simultaneous shots are useful when both trajectories fit inside the target.
@@ -208,6 +260,7 @@ class FireControl:
             compatible &= abs(angle(aim[0] - gun_aim[0])) * d < target["radius"] + 2
             fire[i] = bool(
                 not target.get("lob")
+                and not target.get("arc_only")
                 and compatible
                 and d <= gun["stats"]["range"] + 2
                 and abs(angle(yaw - gun_aim[0])) < 0.15

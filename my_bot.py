@@ -14,6 +14,10 @@ def unit(x, y):
     return (x / norm, y / norm) if norm > 0.001 else (0.0, 0.0)
 
 
+def point_direction(p, origin):
+    return math.atan2(p[1] - origin[1], p[0] - origin[0])
+
+
 def clamp(v, low, high):
     return max(low, min(high, v))
 
@@ -23,7 +27,7 @@ WEAPON_VALUE = {"gun": 0, "lightning": 90, "mortar": 114, "laser": 134}
 
 
 class Aegis:
-    name = "Aegis-Skyline"
+    name = "Aegis-Sentinel"
 
     def __init__(self, hello, campus=None):
         self.config = hello["config"]
@@ -34,9 +38,13 @@ class Aegis:
             except (OSError, EOFError, ValueError, KeyError, IndexError):
                 pass
         self.route = RouteFollower(self.campus)
-        self.control = FireControl(self.campus)
+        self.control = FireControl(self.campus, 1.0 / self.config["match"]["tick_hz"])
         self.rng = random.Random(hello.get("seed", 0))
         self.items = {}
+        self.attackers = {}
+        self.repairing = False
+        self.round_history = {}
+        self.observed_lead = 0.45
         self.aggressor = None
         self.damage_yaw = None
         self.last_damage = -100.0
@@ -110,6 +118,7 @@ class Aegis:
                 if event.get("bearing") is not None:
                     self.aggressor, self.damage_yaw = event.get("by"), event["bearing"]
                     self.last_damage = now
+                    self.attackers[self.aggressor] = now
                     self.hurt_rate += event.get("amount", 0) / me["max_hp"]
             elif event["type"] == "kill":
                 if self.deposit and self.deposit[0] == event.get("target"):
@@ -306,6 +315,41 @@ class Aegis:
         self.goal, self.goal_key = goal, key
         return goal, key, urgent
 
+    def update_shot_estimate(self, obs, me, enemy):
+        """Estimate whether this opponent is leading our strafe or aiming at our current position."""
+        x, y = me["pos"][:2]
+        vx, vy = me["vel"][:2]
+        ex, ey = enemy["pos"][:2]
+        dist = distance(me["pos"], enemy["pos"])
+        if not (28 < dist < 200):
+            return False
+        self.round_history = {i: t for i, t in self.round_history.items() if t > obs["t"] - 1.2}
+        lead_detected = False
+        for p in obs["projectiles"]:
+            if p["kind"] != "gun" or p["id"] in self.round_history:
+                continue
+            px, py = p["pos"][:2]
+            sx, sy = p["vel"][:2]
+            speed = math.hypot(sx, sy)
+            if speed < 20 or distance(p["pos"], enemy["pos"]) > 0.63 * dist:
+                continue
+            # Project the round and the moving mech onto the same lateral axis.
+            ux, uy = sx / speed, sy / speed
+            toward = (x - px) * ux + (y - py) * uy
+            if toward <= 0 or abs((px - ex) * uy - (py - ey) * ux) > 9:
+                continue
+            self.round_history[p["id"]] = obs["t"]
+            side = (px - x) * (-uy) + (py - y) * ux
+            travel = (-vx * uy + vy * ux) * toward / speed
+            if abs(travel) < 1.7:
+                continue
+            if abs(side - travel) < abs(side) - 0.65:
+                self.observed_lead = 0.77 * self.observed_lead + 0.23
+                lead_detected |= abs(side - travel) < me["stats"]["radius"] + 1.0
+            elif abs(side) < abs(side - travel) - 0.65:
+                self.observed_lead *= 0.77
+        return lead_detected
+
     def steer(self, obs, goal, key, threats, urgent):
         me, z, now = obs["self"], obs["zone"], obs["t"]
         pos = me["pos"]
@@ -325,9 +369,12 @@ class Aegis:
             ax, ay = unit(x - ex, y - ey)
         else:
             ax, ay = 0.0, 0.0
+        if danger and self.update_shot_estimate(obs, me, danger):
+            self.juke_at = min(self.juke_at, now + 0.25)
         if now >= self.juke_at:
             self.side = -self.side
-            self.juke_at = now + self.rng.uniform(1.05, 2.45)
+            interval = 0.80 if self.observed_lead > 0.68 else 3.4 if self.observed_lead < 0.31 else 1.75
+            self.juke_at = now + interval * self.rng.uniform(0.75, 1.3)
 
         if now - self.check_time >= 0.85:
             progress = distance(pos, self.check_pos) if self.check_pos else 10
@@ -360,9 +407,7 @@ class Aegis:
                 for dx, dy in HEADINGS
             ]
             lip = max(path_height, max(ring), feet + 9.0)
-            energy_needed = (lip - feet) * me["stats"]["jet_drain"] / me["stats"][
-                "max_rise_speed"
-            ] + 9.0
+            energy_needed = (lip - feet) * me["stats"]["jet_drain"] / me["stats"]["max_rise_speed"] + 9.0
             if energy_needed <= me["max_energy"] - 1:
                 if energy < energy_needed:
                     self.ledge_reserve = energy_needed
@@ -490,7 +535,11 @@ class Aegis:
                 floor = feet
             if danger:
                 lateral = -ay * dx + ax * dy
-                score += radial * (dx * ax + dy * ay) + 1.85 * abs(lateral) + 1.2 * self.side * lateral
+                score += (
+                    radial * (dx * ax + dy * ay)
+                    + (2.5 if self.observed_lead < 0.45 else 1.8) * abs(lateral)
+                    + 1.5 * self.side * lateral
+                )
                 if self.campus and retreat:
                     source = (*danger["pos"][:2], danger["pos"][2] + danger["height"] * 0.8)
                     eye = (px, py, max(floor, feet - 5) + me["stats"]["height"] * 0.65)
@@ -515,6 +564,52 @@ class Aegis:
             self.next_jump = now + self.rng.uniform(1.9, 2.9)
         return move, boost, jump
 
+    def select_encounters(self, me, entities, threats, now):
+        health = me["hp"] / me["max_hp"]
+        # Keep the front armor toward an active attacker. If another mech is
+        # looking away, a second duel can wait until the first is resolved.
+        engaged = set(self.attackers)
+        for _, e, line in threats:
+            yaw = math.atan2(me["pos"][1] - e["pos"][1], me["pos"][0] - e["pos"][0])
+            if line and abs(angle(e["aim"][0] - yaw)) < 0.20:
+                engaged.add(e["id"])
+        engaged_contacts = [e for e in entities if e["id"] in engaged]
+        if engaged_contacts:
+            targets = engaged_contacts + [
+                e
+                for e in entities
+                if e["id"] not in engaged and e["kind"] == "mech" and e.get("hp", 1400) < 160
+            ]
+        else:
+            # Keep an unthreatening mech outside the fight until equipment and
+            # health give us a reasonable chance of winning an exchange.
+            stocked = all(w is not None for w in me["weapons"])
+            targets = []
+            for e in entities:
+                d = distance(me["pos"], e["pos"])
+                if e["kind"] != "mech":
+                    if d < 85 and (health > 0.83 or d < 32):
+                        targets.append(e)
+                elif (
+                    d < 55
+                    or e.get("hp", 1400) < 450
+                    or health > 0.91
+                    and (stocked or me["cubes"] >= 2)
+                    and d < 185
+                ):
+                    targets.append(e)
+        if health < 0.86 and not any(line and e["id"] in engaged for _, e, line in threats):
+            self.repairing = True
+        if health > 0.98 or engaged_contacts and now - self.last_damage < 1:
+            self.repairing = False
+        if self.repairing:
+            targets = [
+                e
+                for e in targets
+                if e["id"] in engaged or e["kind"] == "mech" and distance(me["pos"], e["pos"]) < 38
+            ]
+        return targets, engaged_contacts
+
     def act(self, obs):
         me, now = obs["self"], obs["t"]
         self.remember(obs, me, now)
@@ -525,12 +620,12 @@ class Aegis:
             radius = self.config["npc" if npc else "mech"]["radius"] * scale
             height = self.config["npc" if npc else "mech"]["height"] * scale
             entities.append(dict(raw, radius=radius, height=height))
+        self.attackers = {i: since for i, since in self.attackers.items() if now - since < 5}
         threats = self.dangerous(me, [e for e in entities if e["kind"] == "mech"])
-        hp = me["hp"] / me["max_hp"]
-        if (self.hurt_rate > 0.18 and hp < 0.78) or (hp < 0.50 and now - self.last_damage < 2):
+        health = me["hp"] / me["max_hp"]
+        if (self.hurt_rate > 0.18 and health < 0.78) or (health < 0.50 and now - self.last_damage < 2):
             self.withdraw_until = now + 6
         goal, key, urgent = self.objective(obs, me, threats, now)
-        health = me["hp"] / me["max_hp"]
         covering = key[0] in ("heal", "cover", "roof", "drop")
         # Once concealed, give regen time to work instead of resetting it on a crate.
         quiet = (
@@ -550,8 +645,13 @@ class Aegis:
             )
             for c in obs["crates"]
         ]
+        targets, engaged_contacts = self.select_encounters(me, entities, threats, now)
         chosen = self.control.choose(
-            me, entities, crates, quiet, self.aggressor if now - self.last_damage < 3 else None
+            me,
+            targets,
+            [] if engaged_contacts or self.repairing else crates,
+            quiet,
+            self.aggressor if now - self.last_damage < 3 else None,
         )
         if (
             chosen
@@ -574,7 +674,14 @@ class Aegis:
             ]
             if cues:
                 scan = min(cues, key=lambda s: (s["dist"] != "near", s.get("age", 0)))["bearing"]
+        if self.damage_yaw is not None and now - self.last_damage < 0.85 and not engaged_contacts:
+            if not chosen or (
+                chosen[0]["id"] != self.aggressor
+                and abs(angle(point_direction(chosen[1], me["pos"]) - self.damage_yaw)) > 1.6
+            ):
+                chosen, scan = None, self.damage_yaw
         aim, fire, reload = self.control.command(me, chosen, scan, bool(threats))
+        self.control.support_arc(me, aim, fire, engaged_contacts)
         move, boost, jump = self.steer(obs, goal, key, threats, urgent)
         self.last_move = move
         act = dict(
