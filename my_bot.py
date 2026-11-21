@@ -7,6 +7,7 @@ import math
 import random
 import os
 import json
+from navigation import GroundRoutes
 import mechfight as mf
 
 PI = math.pi
@@ -184,10 +185,17 @@ class Bot:
         else:
             # Stay in the current safe area until the next phase matters.
             gx, gy, urgency = x, y, 0.0
-        # For a closing radius 0, treat the zone as fully urgent.
-        if cur_r < 75 and deadline < 50:
-            gx, gy = nxt_c[0], nxt_c[1]
-            urgency = max(urgency, 4.0)
+        if early and nxt_r < 75:
+            # In small circles a fixed 22 m buffer can exceed the entire radius.
+            safe_depth = max(1.5, nxt_r * 0.45)
+            if next_margin >= safe_depth and cur_margin > 2:
+                urgency = 0.0
+            else:
+                gx, gy = nxt_c
+                urgency = 6.0
+        # Any route into the next circle also leads back inside the current one.
+        if urgency and self.map.routes and dist2((x, y), nxt_c) > 12:
+            gx, gy = self.map.routes.waypoint(me["pos"], nxt_c, now)
         ux, uy = unit(gx - x, gy - y)
         return ux * urgency, uy * urgency, urgency, cur_margin, next_margin
 
@@ -267,13 +275,13 @@ class Bot:
         if not target:
             # Slowly scan for targets when not engaged, without wasting ammo.
             desired = me.get("aim", [0, 0])
-            return [desired[0] + 0.045, 0.0], fire, False
+            return [desired[0] + 0.24, 0.0], fire, False
         kind = target.get("kind", "mech")
         tx, ty, tz = target["pos"]
         v = target.get("vel", [0, 0, 0])
         d = math.hypot(tx - sx, ty - sy)
         muzzle = sz + me.get("stats", {}).get("muzzle_height", 7.0)
-        target_z = tz + (4.5 if kind == "mech" else 2.5)
+        target_z = tz + (4.5 * (1 + self.config.get("cubes", {}).get("size_per_cube", 0.05) * target.get("cubes", 0)) if kind == "mech" else 1.75)
         origin = (sx, sy, muzzle)
         dest = (tx, ty, target_z)
         actual_yaw = me.get("aim", [0.0, 0.0])[0]
@@ -282,9 +290,9 @@ class Bot:
         if special_slot is None:
             special_slot = next((i for i, w in enumerate(weapons) if w and w.get("kind") == "lightning" and d < 40), None)
         if special_slot is None:
-            special_slot = next((i for i, w in enumerate(weapons) if w and w.get("kind") == "laser" and d < 260), None)
+            special_slot = next((i for i, w in enumerate(weapons) if w and w.get("kind") == "laser" and w.get("cooldown", 0) <= 0.1 and d < 275), None)
         if special_slot is None:
-            special_slot = next((i for i, w in enumerate(weapons) if w and w.get("kind") == "mortar" and 35 < d < 175), None)
+            special_slot = next((i for i, w in enumerate(weapons) if w and w.get("kind") == "mortar" and w.get("cooldown", 0) <= 0.1 and 30 < d < 190), None)
         slot = special_slot if special_slot is not None else 0
         selected = weapons[slot] if slot < len(weapons) and weapons[slot] else None
         weapon_kind = selected.get("kind", "gun") if selected else "gun"
@@ -296,7 +304,7 @@ class Bot:
         elif weapon_kind == "lightning":
             aim = aim_at(origin, dest)
         elif weapon_kind == "mortar":
-            aim = mortar_aim(origin, dest, v, speed, stats.get("gravity", 22.0))
+            aim = mortar_aim((sx, sy, sz + me.get("stats", {}).get("height", 9) + 0.5), dest, v, speed, stats.get("gravity", 22.0))
             if aim is None:
                 weapon_kind = "gun"
                 slot = next((i for i, w in enumerate(weapons) if w and w.get("kind") == "gun"), 0)
@@ -315,7 +323,10 @@ class Bot:
                 if w.get("ammo", 1) <= 0 and w.get("reload", 0) <= 0:
                     reload = True
                 # Don't spend ammo if target is beyond its range or aim is far off.
-                if d < w.get("stats", {}).get("range", 230) - 4 and angle < 0.20:
+                gun_aim = aim_at(origin, dest, w.get("stats", {}).get("speed", 252), v)
+                # Both triggers share one torso. Save bullets during steep mortar lobs.
+                compatible = abs(aim[1] - gun_aim[1]) * max(1, d) < 5
+                if compatible and d < w.get("stats", {}).get("range", 230) - 4 and angle < 0.20:
                     fire[i] = True
             elif i == slot and k == "laser":
                 charge = w.get("charge", 0.0)
@@ -431,6 +442,9 @@ class Bot:
             stex = 0.25 * ux - 2.5 * side * uy
             stey = 0.25 * uy + 2.5 * side * ux
 
+        if zone_urg >= 4 and (cur_margin < 8 or zone.get("dps", 0) >= 100):
+            # Commit to the escape waypoint even when multiple pursuers push outward.
+            stex, stey = navx, navy
         mx, my = unit(stex, stey)
         moving = abs(stex) + abs(stey) > 0.08
         act["move"] = [mx, my] if moving else [0.0, 0.0]
@@ -463,7 +477,7 @@ class CoverMap:
     """
     def __init__(self, directory):
         self.grid = {}
-        self.cell_size = 35.0
+        self.routes = None
         self.features = []
         if not directory:
             return
@@ -488,7 +502,8 @@ class CoverMap:
                 for gx in range(int((lo_x-5)//35), int((hi_x+5)//35)+1):
                     for gy in range(int((lo_y-5)//35), int((hi_y+5)//35)+1):
                         self.grid.setdefault((gx, gy), []).append(idx)
-        except (OSError, ValueError, TypeError, KeyError):
+            self.routes = GroundRoutes(self, raw, directory)
+        except (OSError, EOFError, ValueError, TypeError, KeyError, IndexError):
             self.grid = {}
             self.features = []
 
@@ -587,25 +602,31 @@ class CoverMap:
         return vector
 
 
-class AegisV2(Bot):
-    name = "Aegis-Survivor-v2"
+class Aegis(Bot):
+    name = "Aegis-Survivor-v3"
 
     def __init__(self, hello):
         super().__init__(hello)
         self.map = CoverMap(hello.get("map",{}).get("dir", ""))
         self.last_aggressor = None
         self.last_aggressor_time = -999.0
-        self.last_weapon_goal = None
-        self.last_weapon_goal_time = -999.0
+        self.focus = None
 
     def choose_target(self, obs, me):
         pos=me['pos']
         enemies=[m for m in obs.get('mechs',()) if m.get('kind')=='mech']
         nearest_enemy=min((dist2(m['pos'],pos) for m in enemies), default=1e6)
         hp_pct=me.get('hp',1400)/max(1,me.get('max_hp',1400))
-        # Don't announce our location by farming while an enemy team is close.
-        if enemies and (nearest_enemy < 125 or hp_pct < 0.55):
-            return min(enemies, key=lambda m: dist2(m['pos'],pos) - (45 if m.get('charging') else 0)), enemies
+        if enemies:
+            def priority(enemy):
+                distance = dist2(enemy["pos"], pos)
+                # Finish wounded pursuers before splitting damage onto another.
+                remaining = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
+                return (distance + 85 * remaining - 18 * (enemy["id"] == self.focus)
+                        - 20 * bool(enemy.get("charging")))
+            target = min(enemies, key=priority)
+            self.focus = target["id"]
+            return target, enemies
         # Drones drop two cubes: a very good low-risk early upgrade source when
         # we can remain outside the 45 m drone engagement range.
         if hp_pct>0.70 and obs.get('alive',16)>7 and nearest_enemy>145:
@@ -618,8 +639,6 @@ class AegisV2(Bot):
             if crates:
                 m=min(crates,key=lambda m: dist2(m['pos'],pos) + m.get('hp',300)*0.01)
                 return {'kind':'crate', 'pos':m['pos'], 'vel':[0,0,0]},enemies
-        if enemies:
-            return min(enemies,key=lambda m:dist2(m['pos'],pos)),enemies
         return None,enemies
 
     def choose_loot(self, obs, me, enemies, zone):
@@ -639,17 +658,16 @@ class AegisV2(Bot):
         # Pick up items if we are already standing on them, even during combat.
         for p in sorted(obs.get('pickups',()),key=lambda p:dist2(p['pos'],pos)):
             dd=dist2(p['pos'],pos)
-            if dd>self.pickup_radius-0.25 or abs(p['pos'][2]-sz)>4: break
-            if p.get('kind') in owned: continue
-            empty=next((i for i,w in enumerate(weapons) if w is None),None)
-            if empty is not None:
-                action['take']=p['id'];break
-            slot=next((i for i,w in enumerate(weapons) if w and w.get('kind')=='gun'),None)
-            if slot is not None and p.get('kind') in ('laser','mortar'):
-                action['take']=p['id'];action['drop']=slot;break
-        # Health regeneration is worth more than a risky cube sprint.
-        if hp_pct<0.70 and nearest_enemy>115:
-            return None,action
+            if dd > self.pickup_radius:
+                break
+            if abs(p["pos"][2] - sz) > 4 or p["kind"] in owned:
+                continue
+            if None in weapons:
+                action["take"] = p["id"]
+                break
+            if p["kind"] == "laser" and "mortar" in owned:
+                action.update(take=p["id"], drop=owned.index("mortar"))
+                break
         options=[]
         if safe_to_loot:
             for cube in obs.get('cubes',()):
@@ -704,16 +722,8 @@ class AegisV2(Bot):
                                if m.get('kind')=='mech'),default=1e6)
             if nearest_enemy>80 or gun.get('ammo',12)<=0:
                 reload=True
-        # Avoid wasting HP regeneration / attracting enemies while badly wounded.
-        if me.get('hp',0)<0.72*me.get('max_hp',1):
-            enemies=[m for m in obs.get('mechs',()) if m.get('kind')=='mech']
-            d=min((dist2(m['pos'],me['pos']) for m in enemies),default=1e6)
-            if d>82:
-                fire=[False,False]
-                # If laser is already charged, release rather than wait indefinitely.
-                if any(w and w.get('kind')=='laser' and w.get('charge',0)>0 for w in weapons):
-                    fire=[False,False]
-        # The protocol says true/false is the trigger *state*, not a fire pulse.
+        if target and target["kind"] != "mech" and me["hp"] < 0.8 * me["max_hp"]:
+            fire = [False, False]
         return aim,fire,reload
 
     def act(self, obs):
@@ -743,17 +753,14 @@ class AegisV2(Bot):
         # If the zone has already engulfed us, aggressively use remaining energy.
         if not me.get('in_zone', True) and me.get('energy',0)>10 and math.hypot(*act['move'])>0.5:
             act['boost']=True
-        # Taking a few seconds to heal can be decisive, provided we are in
-        # the present and next circles, have no exposed enemies, and stay quiet.
-        if me.get('hp',0)<0.84*me.get('max_hp',1) and closest>125:
-            z=obs.get('zone',{})
-            c=z.get('next_center',z.get('center',(0,0)))
-            if dist2(pos,c)<float(z.get('next_radius',0))-40:
-                act['fire']=[False,False]
-                if not obs.get('cubes') and not obs.get('drops'):
-                    act['move']=[0.0,0.0]
-                    act['boost']=False
+        sound = next((s for s in obs.get("sounds", ()) if s.get("dist") == "near"
+                      and s.get("kind") in ("gun", "laser_charge", "boost", "step")), None)
+        if not enemies and sound:
+            # Turn sensors toward the most recent close threat behind us.
+            if not any(act["fire"]):
+                act["aim"] = [sound["bearing"], 0.0]
         return act
 
 
-mf.run(AegisV2)
+if __name__ == "__main__":
+    mf.run(Aegis)
