@@ -5,6 +5,8 @@ The bot deliberately favors placement and survival over risky eliminations.
 """
 import math
 import random
+import os
+import json
 import mechfight as mf
 
 PI = math.pi
@@ -449,4 +451,309 @@ class Bot:
         return act
 
 
-mf.run(Bot)
+
+# ---- Aegis V2: map-aware survival, non-player objectives, and recovery ----
+
+
+class CoverMap:
+    """Compact, optional 2-D obstacle index over grounded building footprints.
+
+    If the competition map is unavailable or differs from the documented
+    structure, navigation falls back to the v1 reactive movement policy.
+    """
+    def __init__(self, directory):
+        self.grid = {}
+        self.cell_size = 35.0
+        self.features = []
+        if not directory:
+            return
+        try:
+            with open(os.path.join(directory, "v2", "world.json"), encoding="utf-8") as fh:
+                raw = json.load(fh)
+            for p in raw.get("prisms", []):
+                ring = p.get("ring", [])
+                if not isinstance(ring, list) or len(ring) < 6:
+                    continue
+                pts = tuple((float(ring[j]), float(ring[j+1])) for j in range(0, len(ring)-1, 2))
+                lo_x = min(t[0] for t in pts)
+                hi_x = max(t[0] for t in pts)
+                lo_y = min(t[1] for t in pts)
+                hi_y = max(t[1] for t in pts)
+                feat = (pts, float(p.get("base", -100.0)),
+                        float(p.get("top", 100.0)), (lo_x, lo_y, hi_x, hi_y),
+                        p.get("holes", []))
+                idx = len(self.features)
+                self.features.append(feat)
+                # Massive stadium prisms occupy many cells; still acceptable at initialization.
+                for gx in range(int((lo_x-5)//35), int((hi_x+5)//35)+1):
+                    for gy in range(int((lo_y-5)//35), int((hi_y+5)//35)+1):
+                        self.grid.setdefault((gx, gy), []).append(idx)
+        except (OSError, ValueError, TypeError, KeyError):
+            self.grid = {}
+            self.features = []
+
+    @staticmethod
+    def inside(poly, x, y):
+        state = False
+        x0, y0 = poly[-1]
+        for x1, y1 in poly:
+            if (y0 > y) != (y1 > y):
+                cross = (x1-x0) * (y-y0) / (y1-y0) + x0
+                if x < cross:
+                    state = not state
+            x0, y0 = x1, y1
+        return state
+
+    @staticmethod
+    def to_points(pts):
+        if not isinstance(pts, list) or len(pts) < 6:
+            return ()
+        try:
+            return tuple((float(pts[j]),float(pts[j+1])) for j in range(0,len(pts)-1,2))
+        except (ValueError, TypeError):
+            return ()
+
+    @staticmethod
+    def near_wall(poly, x, y, radius):
+        # Also detect a cylindrical mech touching a wall even when its center
+        # is just outside the actual polygon.
+        x0, y0 = poly[-1]
+        rr = radius * radius
+        for x1, y1 in poly:
+            vx, vy = x1-x0, y1-y0
+            seg = vx*vx+vy*vy
+            t = clamp(((x-x0)*vx+(y-y0)*vy)/max(1e-8, seg),0.0,1.0)
+            if (x-x0-t*vx)**2+(y-y0-t*vy)**2 < rr:
+                return True
+            x0,y0=x1,y1
+        return False
+
+    def blocked(self, x, y, z, radius=2.75):
+        if not self.features:
+            return False
+        gx, gy = int(x//35), int(y//35)
+        for idx in self.grid.get((gx,gy), ()):
+            poly,base,top,bb,holes = self.features[idx]
+            # Ignore overhead bridges and prisms fully beneath our mech.
+            if z + 8.5 <= base or z + 1.2 >= top:
+                continue
+            if x < bb[0]-radius or x > bb[2]+radius or y < bb[1]-radius or y > bb[3]+radius:
+                continue
+            body = self.inside(poly,x,y)
+            touch = self.near_wall(poly,x,y,radius)
+            if not body and not touch:
+                continue
+            # Courtyards and gaps in stadium footprints must remain passable.
+            if holes and body:
+                in_hole = False
+                for h in holes:
+                    points = self.to_points(h)
+                    if points and self.inside(points,x,y) and not self.near_wall(points,x,y,radius):
+                        in_hole=True
+                        break
+                if in_hole:
+                    continue
+            return True
+        return False
+
+    def safe_vector(self, pos, vector, zone):
+        """Avoid driving into known obstacles; short horizon + zone barrier."""
+        if not self.features:
+            return vector
+        x,y,z=pos
+        dx,dy=unit(*vector)
+        if dx==dy==0:
+            return vector
+        # Don't interfere with valid directions; solves the common "stuck at wall" problem.
+        def possible(ax, ay):
+            for d in (5.0, 10.0, 16.0):
+                px,py=x+ax*d,y+ay*d
+                if self.blocked(px,py,z):
+                    return False
+                if zone and d>5:
+                    c=zone.get('center',(0,0))
+                    r=float(zone.get('radius',500))
+                    if math.hypot(px-c[0],py-c[1]) > r + 3 and math.hypot(x-c[0],y-c[1]) < r-8:
+                        return False
+            return True
+        if possible(dx,dy):
+            return vector
+        # Prefer a nearby tangent, retaining the original steering's intention.
+        for angle in (0.27,-0.27,0.55,-0.55,0.85,-0.85,1.15,-1.15,1.55,-1.55,2.0,-2.0):
+            a=math.atan2(dy,dx)+angle
+            vx,vy=math.cos(a),math.sin(a)
+            if possible(vx,vy):
+                return vx,vy
+        return vector
+
+
+class AegisV2(Bot):
+    name = "Aegis-Survivor-v2"
+
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.map = CoverMap(hello.get("map",{}).get("dir", ""))
+        self.last_aggressor = None
+        self.last_aggressor_time = -999.0
+        self.last_weapon_goal = None
+        self.last_weapon_goal_time = -999.0
+
+    def choose_target(self, obs, me):
+        pos=me['pos']
+        enemies=[m for m in obs.get('mechs',()) if m.get('kind')=='mech']
+        nearest_enemy=min((dist2(m['pos'],pos) for m in enemies), default=1e6)
+        hp_pct=me.get('hp',1400)/max(1,me.get('max_hp',1400))
+        # Don't announce our location by farming while an enemy team is close.
+        if enemies and (nearest_enemy < 125 or hp_pct < 0.55):
+            return min(enemies, key=lambda m: dist2(m['pos'],pos) - (45 if m.get('charging') else 0)), enemies
+        # Drones drop two cubes: a very good low-risk early upgrade source when
+        # we can remain outside the 45 m drone engagement range.
+        if hp_pct>0.70 and obs.get('alive',16)>7 and nearest_enemy>145:
+            drones=[m for m in obs.get('mechs',()) if m.get('kind')=='npc'
+                    and dist2(m['pos'],pos)<175]
+            if drones:
+                m=min(drones,key=lambda m:dist2(m['pos'],pos)+m.get('hp',350)*0.015)
+                return m,enemies
+            crates=[m for m in obs.get('crates',()) if dist2(m['pos'],pos)<160]
+            if crates:
+                m=min(crates,key=lambda m: dist2(m['pos'],pos) + m.get('hp',300)*0.01)
+                return {'kind':'crate', 'pos':m['pos'], 'vel':[0,0,0]},enemies
+        if enemies:
+            return min(enemies,key=lambda m:dist2(m['pos'],pos)),enemies
+        return None,enemies
+
+    def choose_loot(self, obs, me, enemies, zone):
+        sx,sy,sz=me['pos']
+        pos=me['pos']
+        hp_pct=me.get('hp',1)/max(1,me.get('max_hp',1))
+        nearest_enemy=min((dist2(m['pos'],pos) for m in enemies),default=1e6)
+        current_center=zone.get('center',[0,0])
+        next_center=zone.get('next_center',current_center)
+        next_radius=float(zone.get('next_radius',zone.get('radius',500)))
+        now=float(obs.get('t',0.0))
+        urgency=next_radius-dist2(pos,next_center)
+        safe_to_loot = nearest_enemy > (95 if hp_pct > 0.80 else 145) and urgency>-35
+        weapons=me.get('weapons',[])
+        owned=[w.get('kind') for w in weapons if w]
+        action={}
+        # Pick up items if we are already standing on them, even during combat.
+        for p in sorted(obs.get('pickups',()),key=lambda p:dist2(p['pos'],pos)):
+            dd=dist2(p['pos'],pos)
+            if dd>self.pickup_radius-0.25 or abs(p['pos'][2]-sz)>4: break
+            if p.get('kind') in owned: continue
+            empty=next((i for i,w in enumerate(weapons) if w is None),None)
+            if empty is not None:
+                action['take']=p['id'];break
+            slot=next((i for i,w in enumerate(weapons) if w and w.get('kind')=='gun'),None)
+            if slot is not None and p.get('kind') in ('laser','mortar'):
+                action['take']=p['id'];action['drop']=slot;break
+        # Health regeneration is worth more than a risky cube sprint.
+        if hp_pct<0.70 and nearest_enemy>115:
+            return None,action
+        options=[]
+        if safe_to_loot:
+            for cube in obs.get('cubes',()):
+                dd=dist2(cube['pos'],pos)
+                if dd>100 or abs(cube['pos'][2]-sz)>4:continue
+                if not within_zone(cube['pos'], next_center, max(12,next_radius+10)):
+                    continue
+                # Pure power cubes have large immediate value, especially before 3 cubes.
+                value=78.0 if me.get('cubes',0)<3 else 55.0
+                options.append((value - 0.47*dd, cube['pos'][:2]))
+            # Capture supply drops for 3 cubes, full health and energy; approach
+            # early enough for the 4 s capture timer once the drop lands.
+            for drop in obs.get('drops',()):
+                if drop.get('holder') not in (None,me.get('id')):continue
+                dd=dist2(drop['pos'],pos)
+                lands=float(drop.get('lands_in',999))
+                if lands>25 or dd>170 or not within_zone(drop['pos'],next_center,max(12,next_radius+10)):
+                    continue
+                value=120 + (55 if hp_pct<0.9 else 0) - 0.45*dd - max(0,lands-8)*0.6
+                options.append((value,drop['pos'][:2]))
+            if len(weapons)<2 or any(w is None for w in weapons):
+                for p in obs.get('pickups',()):
+                    dd=dist2(p['pos'],pos)
+                    if dd>120 or abs(p['pos'][2]-sz)>4 or p.get('kind') in owned:continue
+                    if not within_zone(p['pos'],next_center,max(12,next_radius+10)):continue
+                    values={'laser':88,'mortar':78,'lightning':56}
+                    options.append((values.get(p.get('kind'), 0)-0.49*dd,p['pos'][:2]))
+            # Farm a crate or NPC if it can be finished without advancing into danger.
+            if hp_pct>0.78 and obs.get('alive',16)>8 and me.get('cubes',0)<6:
+                for m in obs.get('mechs',()):
+                    if m.get('kind')!='npc':continue
+                    dd=dist2(m['pos'],pos)
+                    if 60<dd<135 and within_zone(m['pos'],next_center,max(12,next_radius+10)):
+                        options.append((35-0.24*dd,m['pos'][:2]))
+                for p in obs.get('crates',()):
+                    dd=dist2(p['pos'],pos)
+                    if 55<dd<120 and within_zone(p['pos'],next_center,max(12,next_radius+10)):
+                        options.append((27-0.22*dd,p['pos'][:2]))
+        if options:
+            best=max(options,key=lambda a:a[0])
+            if best[0]>2:
+                return best[1],action
+        return None,action
+
+    def combat(self, obs, me, target):
+        aim,fire,reload=super().combat(obs,me,target)
+        weapons=me.get('weapons',())
+        # Never let a gun run empty during an unavoidable close encounter.
+        gun=next((w for w in weapons if w and w.get('kind')=='gun'),None)
+        if gun and gun.get('ammo',12)<=3 and gun.get('reload',0)<=0:
+            nearest_enemy=min((dist2(m['pos'],me['pos']) for m in obs.get('mechs',())
+                               if m.get('kind')=='mech'),default=1e6)
+            if nearest_enemy>80 or gun.get('ammo',12)<=0:
+                reload=True
+        # Avoid wasting HP regeneration / attracting enemies while badly wounded.
+        if me.get('hp',0)<0.72*me.get('max_hp',1):
+            enemies=[m for m in obs.get('mechs',()) if m.get('kind')=='mech']
+            d=min((dist2(m['pos'],me['pos']) for m in enemies),default=1e6)
+            if d>82:
+                fire=[False,False]
+                # If laser is already charged, release rather than wait indefinitely.
+                if any(w and w.get('kind')=='laser' and w.get('charge',0)>0 for w in weapons):
+                    fire=[False,False]
+        # The protocol says true/false is the trigger *state*, not a fire pulse.
+        return aim,fire,reload
+
+    def act(self, obs):
+        act=super().act(obs)
+        me=obs['self']
+        pos=me['pos']
+        now=float(obs.get('t',0.0))
+        enemies=[m for m in obs.get('mechs',()) if m.get('kind')=='mech']
+        closest=min((dist2(m['pos'],pos) for m in enemies),default=1e6)
+        # Rear damage is especially painful (1.5x). Don't keep staring at a
+        # distant farming target when a closer attacker is shooting our back.
+        for ev in obs.get('events',()):
+            if ev.get('type')=='damaged' and ev.get('bearing') is not None and ev.get('rear'):
+                self.last_aggressor=float(ev['bearing'])
+                self.last_aggressor_time=now
+        if self.last_aggressor is not None and now-self.last_aggressor_time<0.9:
+            angle=yaw_diff(self.last_aggressor, act.get('aim',(0,0))[0])
+            if abs(angle)>1.0 and closest>38:
+                act['aim']=[self.last_aggressor,0.0]
+                act['fire']=[False,False]
+        # Move around solid obstructions rather than spending match seconds
+        # running face first into building footprints.
+        move=act.get('move',[0.0,0.0])
+        if math.hypot(*move)>0.1:
+            mx,my=self.map.safe_vector(pos,move,obs.get('zone'))
+            act['move']=list(unit(mx,my))
+        # If the zone has already engulfed us, aggressively use remaining energy.
+        if not me.get('in_zone', True) and me.get('energy',0)>10 and math.hypot(*act['move'])>0.5:
+            act['boost']=True
+        # Taking a few seconds to heal can be decisive, provided we are in
+        # the present and next circles, have no exposed enemies, and stay quiet.
+        if me.get('hp',0)<0.84*me.get('max_hp',1) and closest>125:
+            z=obs.get('zone',{})
+            c=z.get('next_center',z.get('center',(0,0)))
+            if dist2(pos,c)<float(z.get('next_radius',0))-40:
+                act['fire']=[False,False]
+                if not obs.get('cubes') and not obs.get('drops'):
+                    act['move']=[0.0,0.0]
+                    act['boost']=False
+        return act
+
+
+mf.run(AegisV2)
